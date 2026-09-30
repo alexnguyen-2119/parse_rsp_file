@@ -1,0 +1,235 @@
+---
+- name: Check if .rsp certificate bundle exists
+  ansible.builtin.stat:
+    path: "{{ cert_bundle_rsp }}"
+  register: rsp_stat
+
+- name: Validate .rsp certificate bundle exists and has content
+  ansible.builtin.assert:
+    that:
+      - rsp_stat.stat.exists
+      - rsp_stat.stat.isreg
+      - (rsp_stat.stat.size | int) > 0
+    fail_msg: >-
+      File {{ cert_bundle_rsp }} is missing or empty. Place a non-empty response file in the workspace root.
+
+- name: Set certificate bundle file
+  ansible.builtin.set_fact:
+    cert_bundle_file: "{{ cert_bundle_rsp }}"
+
+- name: Create local working directory
+  ansible.builtin.file:
+    path: "{{ local_work_dir }}"
+    state: directory
+    mode: "0700"
+
+- name: Try to extract certificates from PKCS#7 response file
+  ansible.builtin.command:
+    argv:
+      - openssl
+      - pkcs7
+      - -in
+      - "{{ cert_bundle_file }}"
+      - -print_certs
+      - -out
+      - "{{ local_work_dir }}/extracted.pem"
+  register: pkcs7_extract
+  failed_when: false
+  changed_when: pkcs7_extract.rc == 0
+
+- name: Count certificates in extracted PKCS#7 output
+  ansible.builtin.shell: |
+    set -o pipefail
+    grep -c -- "-----BEGIN CERTIFICATE-----" "{{ local_work_dir }}/extracted.pem" || true
+  args:
+    executable: /bin/bash
+  register: extracted_cert_count_cmd
+  changed_when: false
+  when: pkcs7_extract.rc == 0
+
+- name: Set extracted certificate count
+  ansible.builtin.set_fact:
+    extracted_cert_count: "{{ (extracted_cert_count_cmd.stdout | default('0') | trim | int) if pkcs7_extract.rc == 0 else 0 }}"
+
+- name: Select certificate source file
+  ansible.builtin.set_fact:
+    cert_source_file: "{{ local_work_dir ~ '/extracted.pem' if (extracted_cert_count | int) > 0 else cert_bundle_file }}"
+
+- name: Remove previously generated local certificate files
+  ansible.builtin.shell: |
+    rm -f "{{ local_work_dir }}"/cert*.pem "{{ local_work_dir }}"/cert*.der
+  args:
+    executable: /bin/bash
+  changed_when: false
+
+- name: Split selected source into local certificate PEM files
+  ansible.builtin.shell: |
+    awk -v outdir="{{ local_work_dir }}" '
+      /-----BEGIN CERTIFICATE-----/ {
+        in_cert = 1
+        idx += 1
+        outfile = sprintf("%s/cert%d.pem", outdir, idx - 1)
+      }
+      in_cert { print > outfile }
+      /-----END CERTIFICATE-----/ { in_cert = 0 }
+    ' "{{ cert_source_file }}"
+  args:
+    executable: /bin/bash
+  changed_when: true
+
+- name: Find generated certificate PEM files
+  ansible.builtin.find:
+    paths: "{{ local_work_dir }}"
+    patterns: "cert*.pem"
+    file_type: file
+  register: cert_pem_files
+
+- name: Ensure exactly three certificates are found
+  ansible.builtin.assert:
+    that:
+      - cert_pem_files.matched == 3
+    fail_msg: "Expected exactly 3 certificates, found {{ cert_pem_files.matched }} in {{ cert_source_file }}"
+
+- name: Build certificate index list
+  ansible.builtin.set_fact:
+    cert_indices: "{{ range(0, cert_pem_files.matched | int) | list }}"
+
+- name: Read certificate subjects
+  ansible.builtin.command:
+    argv:
+      - openssl
+      - x509
+      - -in
+      - "{{ local_work_dir }}/cert{{ item }}.pem"
+      - -noout
+      - -subject
+      - -nameopt
+      - RFC2253
+  register: cert_subjects
+  changed_when: false
+  loop: "{{ cert_indices }}"
+
+- name: Read certificate issuers
+  ansible.builtin.command:
+    argv:
+      - openssl
+      - x509
+      - -in
+      - "{{ local_work_dir }}/cert{{ item }}.pem"
+      - -noout
+      - -issuer
+      - -nameopt
+      - RFC2253
+  register: cert_issuers
+  changed_when: false
+  loop: "{{ cert_indices }}"
+
+- name: Build certificate metadata list
+  ansible.builtin.set_fact:
+    cert_info: "{{ cert_info | default([]) + [ {
+      'index': item,
+      'subject': (cert_subjects.results[item].stdout | regex_replace('^subject=', '')),
+      'issuer': (cert_issuers.results[item].stdout | regex_replace('^issuer=', '')),
+      'self_signed': ((cert_subjects.results[item].stdout | regex_replace('^subject=', '')) == (cert_issuers.results[item].stdout | regex_replace('^issuer=', '')))
+    } ] }}"
+  loop: "{{ cert_indices }}"
+
+- name: Build issuer subject list
+  ansible.builtin.set_fact:
+    all_issuers: "{{ cert_info | map(attribute='issuer') | list }}"
+
+- name: Initialize classification lists
+  ansible.builtin.set_fact:
+    root_candidates: []
+    signing_ca_candidates: []
+    issued_candidates: []
+
+- name: Classify root certificate candidates
+  ansible.builtin.set_fact:
+    root_candidates: "{{ root_candidates + [item] }}"
+  when: item.self_signed
+  loop: "{{ cert_info }}"
+
+- name: Classify signing CA candidates
+  ansible.builtin.set_fact:
+    signing_ca_candidates: "{{ signing_ca_candidates + [item] }}"
+  when:
+    - not item.self_signed
+    - item.subject in all_issuers
+  loop: "{{ cert_info }}"
+
+- name: Classify issued certificate candidates
+  ansible.builtin.set_fact:
+    issued_candidates: "{{ issued_candidates + [item] }}"
+  when:
+    - not item.self_signed
+    - item.subject not in all_issuers
+  loop: "{{ cert_info }}"
+
+- name: Validate exactly one certificate per role
+  ansible.builtin.assert:
+    that:
+      - root_candidates | length == 1
+      - signing_ca_candidates | length == 1
+      - issued_candidates | length == 1
+    fail_msg: >-
+      Classification failed.
+      root={{ root_candidates | length }},
+      signing_ca={{ signing_ca_candidates | length }},
+      issued={{ issued_candidates | length }}.
+      subjects={{ cert_info | map(attribute='subject') | list }}
+
+- name: Ensure PEM output directory exists
+  ansible.builtin.file:
+    path: "{{ pem_output_dir }}"
+    state: directory
+    mode: "0700"
+
+- name: Store issued certificate as PEM
+  ansible.builtin.copy:
+    src: "{{ local_work_dir }}/cert{{ issued_candidates[0].index }}.pem"
+    dest: "{{ pem_output_dir }}/issued-certificate.pem"
+    mode: "0600"
+    remote_src: true
+
+- name: Store signing CA certificate as PEM
+  ansible.builtin.copy:
+    src: "{{ local_work_dir }}/cert{{ signing_ca_candidates[0].index }}.pem"
+    dest: "{{ pem_output_dir }}/signing-ca-certificate.pem"
+    mode: "0600"
+    remote_src: true
+
+- name: Store root CA certificate as PEM
+  ansible.builtin.copy:
+    src: "{{ local_work_dir }}/cert{{ root_candidates[0].index }}.pem"
+    dest: "{{ pem_output_dir }}/root-ca-certificate.pem"
+    mode: "0600"
+    remote_src: true
+
+- name: Compose final PEM output mapping
+  ansible.builtin.set_fact:
+    parsed_certificates:
+      issued_certificate_file: "{{ pem_output_dir }}/issued-certificate.pem"
+      signing_ca_certificate_file: "{{ pem_output_dir }}/signing-ca-certificate.pem"
+      root_ca_certificate_file: "{{ pem_output_dir }}/root-ca-certificate.pem"
+      issued_subject: "{{ issued_candidates[0].subject }}"
+      signing_ca_subject: "{{ signing_ca_candidates[0].subject }}"
+      root_ca_subject: "{{ root_candidates[0].subject }}"
+
+- name: Write parsed certificates to output file
+  ansible.builtin.copy:
+    dest: "{{ output_file }}"
+    mode: "0600"
+    content: |
+      {{ parsed_certificates | to_nice_yaml(indent=2) }}
+
+- name: Show certificate role summary
+  ansible.builtin.debug:
+    msg:
+      issued_subject: "{{ issued_candidates[0].subject }}"
+      signing_ca_subject: "{{ signing_ca_candidates[0].subject }}"
+      root_ca_subject: "{{ root_candidates[0].subject }}"
+      output_file: "{{ output_file }}"
+      issued_certificate_file: "{{ pem_output_dir }}/issued-certificate.pem"
+      signing_ca_certificate_file: "{{ pem_output_dir }}/signing-ca-certificate.pem"
+      root_ca_certificate_file: "{{ pem_output_dir }}/root-ca-certificate.pem"
